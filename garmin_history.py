@@ -1,7 +1,7 @@
-"""Garmin history for the IMLP dashboard.
-need: what was found, and which sessions still need their FIT file.
-build: writes ./history.json (sessions, days, reports) and prints the summary for the report.
-publish <report.json>: checks today's report and adds it to ./history.json."""
+"""Garmin history for the IMLP dashboard (script version 5).
+need: what was found, and which sessions still need their FIT file (every new workout to review, plus rides and runs without FIT readings).
+build: writes ./history.json (sessions, days, reports) and prints the summary for the report, with the new workouts to review.
+publish <report.json>: checks today's report (and its workout reviews) and adds it to ./history.json."""
 import sys, os, io, re, json, glob, math, zipfile, statistics as st, datetime as dt
 
 ARGS = sys.argv[1:]
@@ -10,6 +10,9 @@ def arg(name, default):
 DIR = arg('--dir', '/tmp/claude-tool-results')
 T = {'ftp': arg('--ftp', 267.0), 'lthr': arg('--lthr', 172.0), 'css_s': arg('--css', 100.0),
      'hr_rest': arg('--hrrest', 48.0), 'hr_max': arg('--hrmax', 194.0), 'cap': 152, 'z2_low': 142, 'mod_pct': 80.0}
+SCRIPT_VERSION = 5
+REVIEW_FROM = arg('--review-from', '2026-11-11')  # workout reviews start with the sessions of Wed Nov 11 (CD's request)
+REVIEW_DAYS, REVIEW_MAX, REVIEW_MIN_S = 7, 5, 600   # only the last 7 days, at most 5 a morning, sessions of 10 min or more
 SPORT = {'lap_swimming': 'swim', 'open_water_swimming': 'swim', 'indoor_cycling': 'bike', 'road_biking': 'bike',
          'cycling': 'bike', 'virtual_ride': 'bike', 'gravel_cycling': 'bike', 'mountain_biking': 'bike',
          'running': 'run', 'treadmill_running': 'run', 'trail_running': 'run', 'track_running': 'run',
@@ -93,7 +96,7 @@ YDMIN = 65.6168
 
 def fit_read(data):
     import fitdecode
-    recs, laps, steps, sess = [], [], {}, {}
+    recs, laps, steps, sess, lengths, strap = [], [], {}, {}, [], False
     with fitdecode.FitReader(io.BytesIO(data), check_crc=fitdecode.CrcCheck.DISABLED) as fr:
         for f in fr:
             if not isinstance(f, fitdecode.FitDataMessage):
@@ -107,15 +110,29 @@ def fit_read(data):
                              spd if spd is not None else g('speed'), g('distance')))
             elif f.name == 'lap':
                 s0 = g('start_time')
+                rc = g('avg_running_cadence')
+                sp = g('enhanced_avg_speed')
                 laps.append({'start': s0.timestamp() if s0 else None, 'timer': g('total_timer_time') or 0,
                              'elapsed': g('total_elapsed_time') or g('total_timer_time') or 0,
-                             'intensity': g('intensity'), 'step': g('wkt_step_index')})
+                             'intensity': g('intensity'), 'step': g('wkt_step_index'), 'dist': g('total_distance'),
+                             'hr': g('avg_heart_rate'), 'hr_max': g('max_heart_rate'), 'w': g('avg_power'), 'np': g('normalized_power'),
+                             'cad': rc if rc is not None else g('avg_cadence'), 'spd': sp if sp is not None else g('avg_speed'),
+                             'stroke': g('swim_stroke')})
             elif f.name == 'workout_step':
-                steps[g('message_index')] = g('intensity')
+                steps[g('message_index')] = {'intensity': g('intensity'), 'name': g('wkt_step_name'), 'type': g('target_type'),
+                                             'lo': g('custom_target_value_low'), 'hi': g('custom_target_value_high')}
+            elif f.name == 'length':
+                s0 = g('start_time')
+                lengths.append({'start': s0.timestamp() if s0 else None, 'sec': g('total_timer_time') or 0,
+                                'strokes': g('total_strokes'), 'stroke': g('swim_stroke'), 'active': str(g('length_type')) == 'active'})
+            elif f.name == 'device_info':
+                if 'heart_rate' in (str(g('antplus_device_type')), str(g('device_type'))):
+                    strap = True
             elif f.name == 'session':
-                sess = {'sport': str(g('sport')), 'dist': g('total_distance')}
+                sess = {'sport': str(g('sport')), 'dist': g('total_distance'), 'pool': g('pool_length')}
     recs.sort(key=lambda r: r[0])
     sess['rec_dist'] = next((r[5] for r in reversed(recs) if r[5]), None)
+    sess['lengths'], sess['strap'] = lengths, strap
     return [r[:5] for r in recs], laps, steps, sess
 
 def resample(recs, max_gap=10):
@@ -172,7 +189,7 @@ def fit_metrics(data):
             recs = [r[:4] + ((r[4] * k) if r[4] is not None else None,) for r in recs]
     sec = resample(recs)
     for l in laps:
-        k = l['intensity'] if l['intensity'] is not None else steps.get(l['step']) if l['step'] is not None else None
+        k = l['intensity'] if l['intensity'] is not None else (steps.get(l['step']) or {}).get('intensity') if l['step'] is not None else None
         l['kind'] = str(k) if k is not None else None
     laps = sorted([l for l in laps if l['start'] is not None], key=lambda l: l['start'])
     blocks, cur = [], []
@@ -596,11 +613,194 @@ def plan_summary(plan, al, pmc, load, today):
     return out
 
 
+# ---------- workout reviews: each new swim, ride and run, lap by lap ----------
+ZONES = [('z1', 0, 141), ('z2', 142, 152), ('z3', 153, 163), ('z4', 164, 172), ('z5', 173, 999)]  # plan HR zones (LTHR 172)
+
+def mmss(s):
+    return None if s is None else '%d:%02d' % divmod(int(round(s)), 60)
+
+def step_target(stp):
+    """A workout step's target as text: power in W, HR in bpm (other targets are left to the plan text)."""
+    if not stp or stp.get('lo') is None or stp.get('hi') is None:
+        return None
+    t, lo, hi = str(stp.get('type') or ''), stp['lo'], stp['hi']
+    if 'power' in t:
+        lo, hi = (lo - 1000, hi - 1000) if lo > 1000 else (lo, hi)
+        return '%d–%d W' % (lo, hi) if lo >= 50 else None
+    if 'heart_rate' in t and lo > 100:
+        return '%d–%d bpm' % (lo - 100, hi - 100)
+    return None
+
+def fit_detail(data, r):
+    """Lap by lap (rides, runs) or rep by rep (swims), for the workout's review."""
+    recs, laps, steps, sess = fit_read(data)
+    sport = act_sport(r)
+    out = {'hr_source': 'chest strap' if sess.get('strap') else 'wrist'}
+    hrs = [x[2] for x in resample(recs) if x[2]] if recs else []
+    if hrs:
+        out['hr_zones_min'] = {z: round(sum(1 for h in hrs if a <= h <= b) / 60, 1) for z, a, b in ZONES}
+    laps = sorted([l for l in laps if l['start'] is not None], key=lambda l: l['start'])
+    if sport == 'swim':
+        lens = [x for x in sess.get('lengths') or [] if x['start'] is not None and x['active']]
+        reps, rest = [], 0.0
+        for l in laps:
+            if not l.get('dist'):
+                rest += l['timer'] or 0
+                if reps:
+                    reps[-1][-1] = int(round(reps[-1][-1] + (l['timer'] or 0)))
+                continue
+            a, z = l['start'] - 1, l['start'] + (l['elapsed'] or l['timer'])
+            ln = [x for x in lens if a <= x['start'] < z]
+            strokes = [x['strokes'] for x in ln if x.get('strokes')]
+            kinds = [str(x['stroke']) for x in ln if x.get('stroke') is not None] or ([str(l['stroke'])] if l.get('stroke') else [])
+            stroke = max(set(kinds), key=kinds.count) if kinds else None
+            yd = int(round(l['dist'] / 0.9144))
+            spl = round(st.mean(strokes), 1) if strokes else None
+            sec_len = st.mean(x['sec'] for x in ln) if ln else None
+            reps.append([len(reps) + 1, yd, round(l['timer'], 1), mmss(l['timer'] / yd * 100) if yd else None, stroke, spl,
+                         int(round(sec_len + spl)) if spl is not None and sec_len else None, l.get('hr'), 0])
+        out.update({'reps_cols': ['n', 'yd', 'sec', 'per_100yd', 'stroke', 'strokes_per_length', 'swolf', 'hr', 'rest_after_s'],
+                    'reps': reps, 'swim_yd': sum(x[1] for x in reps), 'swim_min': round(sum(x[2] for x in reps) / 60, 1),
+                    'rest_min': round(rest / 60, 1)})
+        return out
+    run = sport == 'run'
+    k = 1.0
+    if run and sess.get('dist') and sess.get('rec_dist') and abs(sess['dist'] / sess['rec_dist'] - 1) > 0.02:
+        k = sess['dist'] / sess['rec_dist']
+    if k != 1.0:
+        out['treadmill_scale'] = round(k, 3)
+    rows = []
+    for i, l in enumerate(laps):
+        stp = steps.get(l['step']) if l['step'] is not None else None
+        kind = l['intensity'] if l['intensity'] is not None else (stp or {}).get('intensity')
+        spd = (l.get('spd') or 0) * k
+        cad = l.get('cad')
+        rows.append([i + 1, str(kind) if kind is not None else None, (stp or {}).get('name'), step_target(stp),
+                     round((l['timer'] or 0) / 60, 1), round((l.get('dist') or 0) * k / 1609.344, 2), l.get('w'), l.get('np'),
+                     l.get('hr'), l.get('hr_max'), cad * 2 if run and cad else cad,
+                     mmss(1609.344 / spd) if run and spd else None,
+                     round(spd * 2.23694, 1) if not run and spd and not r.get('indoor') else None])
+    out.update({'laps_cols': ['n', 'kind', 'step', 'target', 'min', 'mi', 'avg_w', 'np', 'hr', 'hr_max', 'cad', 'pace_mi', 'mph'],
+                'laps': rows})
+    return out
+
+def review_ids(acts, reports, today):
+    """New swims, rides and runs to review: from REVIEW_FROM and the last REVIEW_DAYS days, not reviewed in an earlier report."""
+    done = {str(w.get('id')) for rep in reports or [] if isinstance(rep, dict)
+            for w in (rep.get('workouts') or []) if isinstance(w, dict)}
+    start = max(REVIEW_FROM, (dt.date.fromisoformat(today) - dt.timedelta(REVIEW_DAYS)).isoformat())
+    c = [r for r in acts.values() if act_sport(r) in ('swim', 'bike', 'run') and not r.get('race') and start <= r['date'] <= today
+         and (r['dur_s'] or 0) >= REVIEW_MIN_S and r['id'] not in done]
+    c.sort(key=lambda r: (r['date'], r['start']), reverse=True)
+    return [r['id'] for r in c[:REVIEW_MAX]], [r['id'] for r in c[REVIEW_MAX:]]
+
+def prev_row(a):
+    sp = act_sport(a)
+    p = {'date': a['date'], 'min': round((a['dur_s'] or 0) / 60)}
+    if sp == 'swim':
+        p.update({'yd': a.get('yd'), 'per_100yd_moving': mmss(a['mov_s'] / a['yd'] * 100) if a.get('yd') and a.get('mov_s') else None})
+    elif sp == 'bike':
+        p.update({k: a.get(k) for k in ('main_w', 'main_np', 'main_hr', 'main_cad', 'ef', 'dec')})
+    else:
+        p.update({'pace_mi': mmss(1609.344 / a['main_mps']) if a.get('main_mps') else None})
+        p.update({k: a.get(k) for k in ('main_hr', 'main_cad', 'ef', 'dec')})
+    return p
+
+def review_entries(ids, al, plan, ready, fits, today):
+    """Everything the review of each new workout needs: plan row, Garmin's numbers, the FIT detail and comparisons."""
+    rows = plan_status(plan, al, today) if plan else []
+    by_act = {a['id']: (s, x) for s, a, x in rows if a}
+    code_of = {aid: (s.get('code') or '') for aid, (s, x) in by_act.items()}
+    rd = {d['date']: d for d in ready}
+    acts = {r['id']: r for r in al}
+    out = []
+    for aid in ids:
+        r = acts[aid]
+        sp = act_sport(r)
+        e = {'id': aid, 'date': r['date'], 'dow': DOW[dt.date.fromisoformat(r['date']).weekday()], 'start': r['start'], 'sport': sp,
+             'type': r['type'], 'indoor': r['indoor'], 'name': r['name'], 'min': round((r['dur_s'] or 0) / 60),
+             'moving_min': round((r.get('mov_s') or 0) / 60), 'hr': r.get('hr'), 'hr_max': r.get('hr_max'), 'tss': int(round(tss(r)))}
+        if sp == 'swim':
+            e['yd'] = r.get('yd')
+            e['per_100yd_moving'] = mmss(r['mov_s'] / r['yd'] * 100) if r.get('yd') and r.get('mov_s') else None
+        else:
+            e['mi'] = round((r.get('dist_m') or 0) / 1609.344, 2)
+            if sp == 'bike':
+                e.update({'avg_w': r.get('w'), 'np': r.get('np'), 'if': round(r['np'] / T['ftp'], 2) if r.get('np') else None,
+                          'vi': round(r['np'] / r['w'], 2) if r.get('np') and r.get('w') else None, 'cad': r.get('cad')})
+            else:
+                e.update({'pace_mi': mmss(1609.344 / r['mps']) if r.get('mps') else None, 'cad': r.get('cad')})
+            mb = {k: r.get(k) for k in ('method', 'main_s', 'main_hr', 'main_w', 'main_np', 'main_cad', 'ef', 'dec', 'over_cap_s', 'z2_s', 'under_z2_s')}
+            if r.get('main_mps'):
+                mb['pace_mi'] = mmss(1609.344 / r['main_mps'])
+            e['main_block'] = mb if r.get('fit') else None
+        sx = by_act.get(aid)
+        if sx:
+            s, x = sx
+            e['plan'] = {'code': s.get('code'), 'session': s.get('tracker_label'), 'planned_date': s['date'], 'slot': s.get('slot'),
+                         'minutes': round(s['minutes']), 'yards': round(s['yards']) or None, 'text': s.get('text'), 'status': x, 'key': s['key']}
+        else:
+            e['plan'] = None
+        code = code_of.get(aid)
+        before = lambda a: (a['date'], a['start']) < (r['date'], r['start'])
+        e['same_session_before'] = [prev_row(a) for a in al if code and a['id'] != aid and before(a) and code_of.get(a['id']) == code][-3:]
+        if sp in ('bike', 'run') and r.get('ef'):
+            lo_s, lo_hr = (1200, 120) if sp == 'bike' else (900, 125)
+            like = [a['ef'] for a in al if act_sport(a) == sp and not a.get('race') and a['indoor'] == r['indoor'] and a.get('ef')
+                    and (a.get('main_s') or 0) >= lo_s and (a.get('main_hr') or 0) >= lo_hr and before(a)][-6:]
+            med = st.median(like) if like else None
+            e['ef_vs_prev6'] = {'ef': r['ef'], 'prev6_median': round(med, 3) if med else None,
+                                'delta_pct': round((r['ef'] - med) / med * 100, 1) if med else None}
+        d = rd.get(r['date'])
+        if d:
+            e['readiness_that_morning'] = {k: d.get(k) for k in ('sleep_h', 'hrv', 'hrv_status', 'rhr', 'rhr_base', 'verdict')}
+        e['detail'] = fits.get(aid)
+        out.append(e)
+    return out
+
+
 # ---------- publish: check today's report and add it to the history file ----------
 SECTIONS = ['Last night', 'Yesterday', 'This morning', 'Training load', 'Next', 'Last week', "Coach's call"]
 CHARTS = ['pmc', 'efride', 'efrun', 'dec', 'sleephours', 'sleepwindow', 'hrv', 'rhr', 'hours']
+GRADES = ['On target', 'Mostly on target', 'Off target']
 
-def check_report(r, today, week):
+def check_workouts(ws, review_ids, err):
+    if ws is None:
+        ws = []
+    if not isinstance(ws, list):
+        err.append('workouts must be a list')
+        return []
+    got = [str(w.get('id')) for w in ws if isinstance(w, dict)]
+    if len(got) != len(set(got)):
+        err.append('workouts has the same id twice')
+    miss = [x for x in review_ids if x not in got]
+    extra = [x for x in got if x not in review_ids]
+    if miss:
+        err.append('workouts is missing a review for: %s' % miss)
+    if extra:
+        err.append('workouts has ids that are not in summary.reviews: %s' % extra)
+    texts = []
+    for w in ws:
+        if not isinstance(w, dict):
+            err.append('each workout review must be an object')
+            continue
+        wid = w.get('id')
+        title, head = str(w.get('title') or ''), str(w.get('headline') or '')
+        if not title.strip() or len(title) > 140:
+            err.append('workout %s: title must be 1-140 characters' % wid)
+        if w.get('grade') not in GRADES:
+            err.append('workout %s: grade must be one of %s' % (wid, GRADES))
+        if not head.strip() or len(head) > 240:
+            err.append('workout %s: headline must be 1-240 characters' % wid)
+        its = w.get('items') if isinstance(w.get('items'), list) else []
+        if not 6 <= len(its) <= 12:
+            err.append('workout %s: 6-12 items needed (now %d)' % (wid, len(its)))
+        if any(not isinstance(i, dict) or not str(i.get('label') or '').strip() or not str(i.get('text') or '').strip() for i in its):
+            err.append('workout %s: every item needs a label and a text' % wid)
+        texts += [title, head] + [str(i.get('text') or '') for i in its if isinstance(i, dict)]
+    return texts
+
+def check_report(r, today, week, review_ids=()):
     err, warn = [], []
     td = dt.date.fromisoformat(today)
     if r.get('date') != today:
@@ -634,9 +834,10 @@ def check_report(r, today, week):
         else:
             for k in CHARTS:
                 n = len(re.findall(r'[.!?](?:\s|$)', str(cn[k] or '')))
-                if not 2 <= n <= 4:
-                    warn.append('chart note %s has %d sentences (2-4 wanted)' % (k, n))
-    text = ' '.join([h] + [str(i.get('text') or '') for i in items] + ([str(v) for v in cn.values()] if isinstance(cn, dict) else []))
+                if not 3 <= n <= 6:
+                    warn.append('chart note %s has %d sentences (3-6 wanted)' % (k, n))
+    wtexts = check_workouts(r.get('workouts'), [str(x) for x in review_ids], err)
+    text = ' '.join([h] + [str(i.get('text') or '') for i in items] + ([str(v) for v in cn.values()] if isinstance(cn, dict) else []) + wtexts)
     for d, m, day in re.findall(r'\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun) (%s) (\d{1,2})\b' % '|'.join(MONTHS), text):
         cands = []
         for y in (td.year - 1, td.year, td.year + 1):
@@ -656,7 +857,7 @@ def check_report(r, today, week):
 def publish(path):
     r = json.load(open(path, encoding='utf-8'))
     state = json.load(open('run_state.json', encoding='utf-8'))
-    err, warn = check_report(r, state['today'], state.get('week'))
+    err, warn = check_report(r, state['today'], state.get('week'), state.get('review_ids') or [])
     if err:
         print(json.dumps({'ok': False, 'errors': err, 'warnings': warn}, ensure_ascii=False))
         sys.exit(1)
@@ -677,10 +878,14 @@ def main():
     today = max(days) if days else dt.date.today().isoformat()
     apply_targets(found['plan'], today)
     since = (dt.date.fromisoformat(today) - dt.timedelta(21)).isoformat()
+    reports = (found['old'] or {}).get('reports') or found['reports_list'] or []
+    rid, rskip = review_ids(acts, reports, today)
     if mode == 'need':
+        nf = [x for x in rid if x not in found['fit']]
+        nf += [r['id'] for r in acts.values() if needs_fit(r, since) and r['id'] not in found['fit'] and r['id'] not in nf]
         print(json.dumps({'old_history': bool(found['old']), 'plan': bool(found['plan']), 'activity_lists': len(found['acts']),
                           'daily': len(found['daily']), 'hrv': len(found['hrv']), 'sleep': len(found['sleep']),
-                          'need_fit': [r['id'] for r in acts.values() if needs_fit(r, since) and r['id'] not in found['fit']]}))
+                          'to_review': rid, 'need_fit': nf}))
         return
     if not found['old']:
         print(json.dumps({'error': 'No history file found, so nothing was built: a rebuild without it would lose the FIT history.'}))
@@ -693,17 +898,25 @@ def main():
                     acts[aid].update(m)
             except Exception as e:  # a bad file leaves that session without FIT metrics
                 print('FIT', aid, repr(e), file=sys.stderr)
+    fits = {}
+    for aid in rid:
+        if aid in found['fit']:
+            try:
+                fits[aid] = fit_detail(found['fit'][aid], acts[aid])
+            except Exception as e:  # the review then uses Garmin's summary numbers only
+                print('FIT detail', aid, repr(e), file=sys.stderr)
     al = sorted(acts.values(), key=lambda r: (r['date'], r['start']))
     dl = [days[k] for k in sorted(days) if k >= '2026-07-01']
     built = dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-    reports = found['old'].get('reports') or found['reports_list'] or []
     json.dump({'built_at': built, 'acts': al, 'days': dl, 'reports': reports}, open('history.json', 'w', encoding='utf-8'),
               separators=(',', ':'), ensure_ascii=False)
     out = summary(acts, days, today, found['plan'])
     week = next((int(w['week']) for w in (found['plan'] or {}).get('weeks', []) if w['start'] <= today <= w['end']), None)
-    json.dump({'today': today, 'week': week}, open('run_state.json', 'w'))
-    out.update({'built_at': built, 'acts': len(al), 'days': len(dl), 'reports_kept': len(reports), 'plan_file': bool(found['plan']),
-                'still_need_fit': [r['id'] for r in al if needs_fit(r, since)]})
+    json.dump({'today': today, 'week': week, 'review_ids': rid}, open('run_state.json', 'w'))
+    out['reviews'] = review_entries(rid, al, found['plan'], readiness([days[k] for k in sorted(days)]), fits, today)
+    out['reviews_skipped'] = [{'id': x, 'date': acts[x]['date'], 'name': acts[x]['name']} for x in rskip]
+    out.update({'script_version': SCRIPT_VERSION, 'built_at': built, 'acts': len(al), 'days': len(dl), 'reports_kept': len(reports),
+                'plan_file': bool(found['plan']), 'still_need_fit': [r['id'] for r in al if needs_fit(r, since)]})
     print(json.dumps(out, separators=(',', ':'), ensure_ascii=False))
 
 
